@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable
 from ollama import Client
+import zmq
 
 # ==================== 数据类 ====================
 
@@ -47,9 +48,13 @@ class VoiceAssistant:
         self.config = config or {}
         self.ollama_host = self.config.get("ollama_host", "localhost:11434")
         self.model_name = self.config.get("model", "qwen2.5:14b")
+        self.orange_pi_addr = self.config.get("orange_pi_addr", "192.168.10.55:5556")
 
         # 初始化 LLM 客户端
         self.llm = Client(host=self.ollama_host)
+
+        # 初始化 ROS2 桥接（ZeroMQ）
+        self._init_ros2_bridge()
 
         # 工具注册表
         self.tools: Dict[str, Callable] = {}
@@ -58,6 +63,19 @@ class VoiceAssistant:
         self.context: Optional[ConversationContext] = None
 
         print(f"[VoiceAssistant] 初始化完成，使用模型: {self.model_name}")
+        print(f"[VoiceAssistant] ROS2 桥接: {self.orange_pi_addr}")
+
+    def _init_ros2_bridge(self):
+        """初始化 ROS2 桥接"""
+        try:
+            self.zmq_context = zmq.Context()
+            self.ros2_socket = self.zmq_context.socket(zmq.REQ)
+            self.ros2_socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2秒超时
+            print(f"[VoiceAssistant] ZeroMQ 客户端已创建")
+        except Exception as e:
+            print(f"[VoiceAssistant] ZeroMQ 初始化失败: {e}")
+            self.zmq_context = None
+            self.ros2_socket = None
 
     # ==================== 工具注册 ====================
 
@@ -205,6 +223,49 @@ class VoiceAssistant:
             print(f"[VoiceAssistant] 生成回复失败: {e}")
             return "抱歉，我遇到了一些问题。"
 
+    # ==================== ROS2 工具 ====================
+
+    async def _send_to_ros2(self, tool: str, params: Dict) -> Dict:
+        """发送指令到 ROS2 桥接"""
+        if not self.ros2_socket:
+            return {"success": False, "error": "ROS2 桥接未初始化"}
+
+        try:
+            # 连接到香橙派
+            self.ros2_socket.connect(f"tcp://{self.orange_pi_addr}")
+
+            # 发送请求
+            request = {"tool": tool, "params": params}
+            self.ros2_socket.send_json(request)
+
+            # 接收响应
+            response = self.ros2_socket.recv_json()
+
+            # 断开连接
+            self.ros2_socket.disconnect(f"tcp://{self.orange_pi_addr}")
+
+            return response
+        except zmq.error.Again:
+            return {"success": False, "error": "ROS2 桥接超时"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def ha_control(self, params: Dict) -> Dict:
+        """Home Assistant 设备控制"""
+        return await self._send_to_ros2("ha_control", params)
+
+    async def arm_control(self, params: Dict) -> Dict:
+        """机械臂控制"""
+        return await self._send_to_ros2("arm_control", params)
+
+    async def base_control(self, params: Dict) -> Dict:
+        """移动底盘控制"""
+        return await self._send_to_ros2("base_control", params)
+
+    async def sensor_query(self, params: Dict) -> Dict:
+        """传感器查询"""
+        return await self._send_to_ros2("sensor_query", params)
+
     # ==================== 测试工具 ====================
 
     async def test_tool(self, params: Dict) -> Dict:
@@ -219,24 +280,41 @@ async def main():
     """主函数 - 测试"""
 
     # 创建助手实例
-    assistant = VoiceAssistant()
+    config = {
+        "ollama_host": "localhost:11434",
+        "model": "qwen2.5:14b",
+        "orange_pi_addr": "192.168.10.55:5556"
+    }
+    assistant = VoiceAssistant(config)
 
-    # 注册测试工具
+    # 注册 ROS2 工具
     assistant.register_tool(
         "light_on",
-        assistant.test_tool,
-        "打开灯光（参数：room=房间名）"
+        assistant.ha_control,
+        "打开灯光（参数：entity_id=设备ID）"
     )
 
     assistant.register_tool(
         "light_off",
-        assistant.test_tool,
-        "关闭灯光（参数：room=房间名）"
+        assistant.ha_control,
+        "关闭灯光（参数：entity_id=设备ID）"
+    )
+
+    assistant.register_tool(
+        "arm_move",
+        assistant.arm_control,
+        "机械臂移动（参数：position=坐标）"
+    )
+
+    assistant.register_tool(
+        "sensor_query",
+        assistant.sensor_query,
+        "查询传感器状态"
     )
 
     # 交互式测试
     print("\n" + "="*50)
-    print("语音助手测试模式")
+    print("语音助手测试模式（已连接 ROS2）")
     print("输入文本测试，输入 'quit' 退出")
     print("="*50 + "\n")
 
