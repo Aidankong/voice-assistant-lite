@@ -33,11 +33,26 @@ class VoiceInput:
         """初始化 Whisper 模型"""
         try:
             print(f"[VoiceInput] 加载 Whisper 模型 ({self.model_size})...")
-            self.model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type="float16" if self.device == "cuda" else "int8"
-            )
+            # 优先使用 ModelScope 下载的模型
+            model_path = "~/.cache/modelscope/Systran/faster-whisper-tiny"
+
+            # 检查 ModelScope 模型是否存在
+            import os
+            expanded_path = os.path.expanduser(model_path)
+            if os.path.exists(expanded_path):
+                print(f"[VoiceInput] 使用 ModelScope 模型: {expanded_path}")
+                self.model = WhisperModel(
+                    expanded_path,
+                    device=self.device,
+                    compute_type="float16" if self.device == "cuda" else "int8"
+                )
+            else:
+                # 使用 HuggingFace 模型
+                self.model = WhisperModel(
+                    self.model_size,
+                    device=self.device,
+                    compute_type="float16" if self.device == "cuda" else "int8"
+                )
             print(f"[VoiceInput] Whisper 模型加载完成")
         except Exception as e:
             print(f"[VoiceInput] Whisper 模型加载失败: {e}")
