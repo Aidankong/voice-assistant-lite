@@ -1,6 +1,6 @@
 """
 语音助手核心类 - 方案B自建轻量框架
-核心功能：意图识别 + 工具执行 + 记忆系统
+核心功能：意图识别 + 工具执行 + 记忆系统 + 唤醒词检测
 """
 
 import asyncio
@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable
 from ollama import Client
 import zmq
+from wake_word_detector import WakeWordDetector
 
 # ==================== 数据类 ====================
 
@@ -49,6 +50,7 @@ class VoiceAssistant:
         self.ollama_host = self.config.get("ollama_host", "localhost:11434")
         self.model_name = self.config.get("model", "qwen2.5:14b")
         self.orange_pi_addr = self.config.get("orange_pi_addr", "192.168.10.55:5556")
+        self.wake_word = self.config.get("wake_word", "Jarvis")
 
         # 初始化 LLM 客户端
         self.llm = Client(host=self.ollama_host)
@@ -56,14 +58,19 @@ class VoiceAssistant:
         # 初始化 ROS2 桥接（ZeroMQ）
         self._init_ros2_bridge()
 
+        # 初始化唤醒词检测
+        self.wake_detector = WakeWordDetector(self.wake_word)
+
         # 工具注册表
         self.tools: Dict[str, Callable] = {}
 
         # 对话上下文
         self.context: Optional[ConversationContext] = None
+        self.waiting_for_command = False  # 是否等待指令
 
         print(f"[VoiceAssistant] 初始化完成，使用模型: {self.model_name}")
         print(f"[VoiceAssistant] ROS2 桥接: {self.orange_pi_addr}")
+        print(f"[VoiceAssistant] 唤醒词: {self.wake_word}")
 
     def _init_ros2_bridge(self):
         """初始化 ROS2 桥接"""
@@ -283,7 +290,8 @@ async def main():
     config = {
         "ollama_host": "localhost:11434",
         "model": "qwen2.5:14b",
-        "orange_pi_addr": "192.168.10.55:5556"
+        "orange_pi_addr": "192.168.10.55:5556",
+        "wake_word": "Jarvis"
     }
     assistant = VoiceAssistant(config)
 
@@ -314,7 +322,8 @@ async def main():
 
     # 交互式测试
     print("\n" + "="*50)
-    print("语音助手测试模式（已连接 ROS2）")
+    print("语音助手测试模式（已连接 ROS2 + 唤醒词检测）")
+    print(f"唤醒词: {assistant.wake_word}")
     print("输入文本测试，输入 'quit' 退出")
     print("="*50 + "\n")
 
@@ -325,8 +334,20 @@ async def main():
             if user_input.lower() in ['quit', 'exit', '退出']:
                 break
 
-            response = await assistant.process(user_input)
-            print(f"助手: {response}\n")
+            # 检查是否包含唤醒词
+            if assistant.wake_detector.check_text(user_input):
+                print(f"[唤醒词检测] 检测到唤醒词!")
+                # 移除唤醒词，处理剩余指令
+                command = user_input.replace(assistant.wake_word, "", 1).strip()
+                if command:
+                    response = await assistant.process(command)
+                    print(f"助手: {response}\n")
+                else:
+                    print("助手: 我在，请说指令\n")
+            else:
+                # 直接处理
+                response = await assistant.process(user_input)
+                print(f"助手: {response}\n")
 
         except KeyboardInterrupt:
             break
