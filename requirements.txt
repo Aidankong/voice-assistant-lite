@@ -1,0 +1,19 @@
+# 语音助手 - 依赖包
+
+# LLM 客户端
+ollama>=0.1.0
+
+# 异步支持
+asyncio
+
+# 向量数据库（记忆系统）
+# chromadb>=0.4.0  # 可选，暂时注释
+
+# 语音相关（后续添加）
+# faster-whisper  # 语音识别
+# edge-tts        # 语音合成
+# openwakeword    # 唤醒词
+
+# ROS2 通信（香橙派端）
+# zmq             # ZeroMQ
+# rclpy           # ROS2 Python 客户端
