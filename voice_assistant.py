@@ -1,6 +1,7 @@
 """
-语音助手核心类 - 方案B自建轻量框架
-核心功能：意图识别 + 工具执行 + 记忆系统 + 唤醒词检测 + 语音 I/O
+语音助手核心类 - 分布式架构
+核心功能：意图识别 + 工具执行 + 记忆系统 + 语音 I/O
+支持：本地音频处理、Orange Pi 分布式音频
 """
 
 import asyncio
@@ -9,9 +10,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable
 from ollama import Client
-import zmq
-from wake_word_detector import WakeWordDetector
+import os
+
+# 清理代理环境变量
+for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']:
+    os.environ.pop(var, None)
+
 from voice_io import VoiceInput, VoiceOutput
+from orangepi_client import OrangePiClient
 
 # ==================== 数据类 ====================
 
@@ -43,7 +49,7 @@ class ConversationContext:
 # ==================== 核心类 ====================
 
 class VoiceAssistant:
-    """轻量级语音助手核心类"""
+    """分布式语音助手核心类"""
 
     def __init__(self, config: dict = None):
         # 默认配置
@@ -52,18 +58,26 @@ class VoiceAssistant:
         self.model_name = self.config.get("model", "qwen2.5:14b")
         self.orange_pi_addr = self.config.get("orange_pi_addr", "192.168.10.55:5556")
         self.wake_word = self.config.get("wake_word", "Jarvis")
+        self.use_orange_pi_audio = self.config.get("use_orange_pi_audio", True)
 
         # 初始化 LLM 客户端
         self.llm = Client(host=self.ollama_host)
 
-        # 初始化 ROS2 桥接（ZeroMQ）
-        self._init_ros2_bridge()
+        # 初始化 Orange Pi 客户端
+        self.orange_pi = None
+        if self.use_orange_pi_audio:
+            try:
+                self.orange_pi = OrangePiClient(
+                    host=self.orange_pi_addr.split(":")[0],
+                    port=int(self.orange_pi_addr.split(":")[1])
+                )
+                print(f"[VoiceAssistant] Orange Pi 音频已启用")
+            except Exception as e:
+                print(f"[VoiceAssistant] Orange Pi 连接失败: {e}")
+                self.use_orange_pi_audio = False
 
-        # 初始化唤醒词检测
-        self.wake_detector = WakeWordDetector(self.wake_word)
-
-        # 初始化语音 I/O
-        self.voice_input = VoiceInput(model_size="tiny", device="cuda")
+        # 初始化语音 I/O（备用或用于 TTS）
+        self.voice_input = VoiceInput(model_size="tiny", device="cpu") if not self.use_orange_pi_audio else None
         self.voice_output = VoiceOutput()
 
         # 工具注册表
@@ -74,20 +88,8 @@ class VoiceAssistant:
         self.waiting_for_command = False  # 是否等待指令
 
         print(f"[VoiceAssistant] 初始化完成，使用模型: {self.model_name}")
-        print(f"[VoiceAssistant] ROS2 桥接: {self.orange_pi_addr}")
+        print(f"[VoiceAssistant] 音频来源: {'Orange Pi' if self.use_orange_pi_audio else '本地'}")
         print(f"[VoiceAssistant] 唤醒词: {self.wake_word}")
-
-    def _init_ros2_bridge(self):
-        """初始化 ROS2 桥接"""
-        try:
-            self.zmq_context = zmq.Context()
-            self.ros2_socket = self.zmq_context.socket(zmq.REQ)
-            self.ros2_socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2秒超时
-            print(f"[VoiceAssistant] ZeroMQ 客户端已创建")
-        except Exception as e:
-            print(f"[VoiceAssistant] ZeroMQ 初始化失败: {e}")
-            self.zmq_context = None
-            self.ros2_socket = None
 
     # ==================== 工具注册 ====================
 
@@ -235,55 +237,95 @@ class VoiceAssistant:
             print(f"[VoiceAssistant] 生成回复失败: {e}")
             return "抱歉，我遇到了一些问题。"
 
+    # ==================== 语音输入（Orange Pi） ====================
+
+    async def listen_for_wake_word(self, duration: int = 3) -> Optional[str]:
+        """
+        监听唤醒词并获取命令
+
+        Args:
+            duration: 监听唤醒词的时长（秒）
+
+        Returns:
+            识别的命令文本，未检测到唤醒词返回 None
+        """
+        if not self.orange_pi:
+            print("[VoiceAssistant] Orange Pi 未连接")
+            return None
+
+        print(f"[VoiceAssistant] 监听唤醒词 '{self.wake_word}' ({duration}秒)...")
+
+        result = self.orange_pi.detect_wake_word(listen_duration=duration)
+
+        if result and result.get("detected"):
+            print("[VoiceAssistant] 检测到唤醒词！")
+            audio_data = result.get("audio")
+
+            if audio_data:
+                # 使用本地 Whisper 识别
+                if not self.voice_input:
+                    self.voice_input = VoiceInput(model_size="tiny", device="cpu")
+
+                text = self.voice_input.transcribe(audio_data)
+                return text
+
+        return None
+
+    async def record_audio(self, duration: int = 5) -> Optional[bytes]:
+        """
+        录音
+
+        Args:
+            duration: 录音时长（秒）
+
+        Returns:
+            音频数据
+        """
+        if self.orange_pi:
+            return self.orange_pi.record_audio(duration)
+        elif self.voice_input:
+            return self.voice_input.record_audio(duration)
+        else:
+            print("[VoiceAssistant] 无可用音频输入")
+            return None
+
     # ==================== ROS2 工具 ====================
 
-    async def _send_to_ros2(self, tool: str, params: Dict) -> Dict:
-        """发送指令到 ROS2 桥接"""
-        if not self.ros2_socket:
-            return {"success": False, "error": "ROS2 桥接未初始化"}
+    async def light_on(self, params: Dict) -> Dict:
+        """开灯"""
+        if self.orange_pi:
+            return self.orange_pi.light_on()
+        return {"success": False, "error": "Orange Pi 未连接"}
 
-        try:
-            # 连接到香橙派
-            self.ros2_socket.connect(f"tcp://{self.orange_pi_addr}")
+    async def light_off(self, params: Dict) -> Dict:
+        """关灯"""
+        if self.orange_pi:
+            return self.orange_pi.light_off()
+        return {"success": False, "error": "Orange Pi 未连接"}
 
-            # 发送请求
-            request = {"tool": tool, "params": params}
-            self.ros2_socket.send_json(request)
-
-            # 接收响应
-            response = self.ros2_socket.recv_json()
-
-            # 断开连接
-            self.ros2_socket.disconnect(f"tcp://{self.orange_pi_addr}")
-
-            return response
-        except zmq.error.Again:
-            return {"success": False, "error": "ROS2 桥接超时"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    async def ha_control(self, params: Dict) -> Dict:
-        """Home Assistant 设备控制"""
-        return await self._send_to_ros2("ha_control", params)
-
-    async def arm_control(self, params: Dict) -> Dict:
-        """机械臂控制"""
-        return await self._send_to_ros2("arm_control", params)
-
-    async def base_control(self, params: Dict) -> Dict:
-        """移动底盘控制"""
-        return await self._send_to_ros2("base_control", params)
+    async def arm_move(self, params: Dict) -> Dict:
+        """机械臂移动"""
+        if self.orange_pi:
+            position = params.get("position", {})
+            speed = params.get("speed", 50)
+            return self.orange_pi.arm_move(position, speed)
+        return {"success": False, "error": "Orange Pi 未连接"}
 
     async def sensor_query(self, params: Dict) -> Dict:
         """传感器查询"""
-        return await self._send_to_ros2("sensor_query", params)
+        if self.orange_pi:
+            status = self.orange_pi.get_status()
+            return {"success": True, "data": status}
+        return {"success": False, "error": "Orange Pi 未连接"}
 
-    # ==================== 测试工具 ====================
-
-    async def test_tool(self, params: Dict) -> Dict:
-        """测试工具"""
-        print(f"[测试工具] 参数: {params}")
-        return {"success": True, "message": "测试成功"}
+    async def capture_image(self, params: Dict) -> Dict:
+        """采集图像"""
+        if self.orange_pi:
+            image = self.orange_pi.capture_image()
+            if image:
+                return {"success": True, "size": len(image)}
+            return {"success": False, "error": "图像采集失败"}
+        return {"success": False, "error": "Orange Pi 未连接"}
 
 
 # ==================== 入口 ====================
@@ -301,48 +343,40 @@ async def main():
         "ollama_host": "localhost:11434",
         "model": "qwen2.5:14b",
         "orange_pi_addr": "192.168.10.55:5556",
-        "wake_word": "Jarvis"
+        "wake_word": "Jarvis",
+        "use_orange_pi_audio": True
     }
     assistant = VoiceAssistant(config)
 
     # 注册 ROS2 工具
-    assistant.register_tool(
-        "light_on",
-        assistant.ha_control,
-        "打开灯光（参数：entity_id=设备ID）"
-    )
-
-    assistant.register_tool(
-        "light_off",
-        assistant.ha_control,
-        "关闭灯光（参数：entity_id=设备ID）"
-    )
-
-    assistant.register_tool(
-        "arm_move",
-        assistant.arm_control,
-        "机械臂移动（参数：position=坐标）"
-    )
-
-    assistant.register_tool(
-        "sensor_query",
-        assistant.sensor_query,
-        "查询传感器状态"
-    )
+    assistant.register_tool("light_on", assistant.light_on, "打开灯光")
+    assistant.register_tool("light_off", assistant.light_off, "关闭灯光")
+    assistant.register_tool("arm_move", assistant.arm_move, "机械臂移动（参数：position=坐标）")
+    assistant.register_tool("sensor_query", assistant.sensor_query, "查询传感器状态")
+    assistant.register_tool("capture_image", assistant.capture_image, "采集图像")
 
     # 交互式测试
     mode = "语音" if use_voice else "文本"
     print("\n" + "="*50)
     print(f"语音助手测试模式（{mode}输入）")
     print(f"唤醒词: {assistant.wake_word}")
-    print(f"ROS2 桥接: {assistant.orange_pi_addr}")
+    print(f"音频来源: {'Orange Pi' if assistant.use_orange_pi_audio else '本地'}")
     print("输入 'quit' 退出，'voice' 切换到语音模式")
     print("="*50 + "\n")
 
     while True:
         try:
-            if use_voice:
-                # 语音输入模式
+            if use_voice and assistant.use_orange_pi_audio:
+                # 使用 Orange Pi 进行唤醒词检测和录音
+                user_input = await assistant.listen_for_wake_word(duration=5)
+
+                if user_input:
+                    print(f"识别: {user_input}")
+                else:
+                    print("未检测到唤醒词，继续监听...")
+                    continue
+            elif use_voice:
+                # 本地语音输入模式
                 print("请说话...")
                 audio_data = assistant.voice_input.record_audio(duration=3)
 

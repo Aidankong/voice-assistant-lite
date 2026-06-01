@@ -7,6 +7,7 @@
 import asyncio
 import numpy as np
 import wave
+import os
 from typing import Optional
 from faster_whisper import WhisperModel
 import edge_tts
@@ -33,20 +34,28 @@ class VoiceInput:
         """初始化 Whisper 模型"""
         try:
             print(f"[VoiceInput] 加载 Whisper 模型 ({self.model_size})...")
-            # 优先使用 ModelScope 下载的模型
-            model_path = "~/.cache/modelscope/Systran/faster-whisper-tiny"
-
-            # 检查 ModelScope 模型是否存在
+            # ModelScope 模型路径列表
             import os
-            expanded_path = os.path.expanduser(model_path)
-            if os.path.exists(expanded_path):
-                print(f"[VoiceInput] 使用 ModelScope 模型: {expanded_path}")
-                self.model = WhisperModel(
-                    expanded_path,
-                    device=self.device,
-                    compute_type="float16" if self.device == "cuda" else "int8"
-                )
-            else:
+            possible_paths = [
+                "~/.cache/whisper/~/.cache/modelscope/Systran/faster-whisper-tiny",
+                "~/.cache/modelscope/Systran/faster-whisper-tiny",
+                "~/.cache/huggingface/hub/models--Systran--faster-whisper-tiny",
+            ]
+
+            model_loaded = False
+            for path in possible_paths:
+                expanded_path = os.path.expanduser(path)
+                if os.path.exists(expanded_path):
+                    print(f"[VoiceInput] 使用本地模型: {expanded_path}")
+                    self.model = WhisperModel(
+                        expanded_path,
+                        device=self.device,
+                        compute_type="float16" if self.device == "cuda" else "int8"
+                    )
+                    model_loaded = True
+                    break
+
+            if not model_loaded:
                 # 使用 HuggingFace 模型
                 self.model = WhisperModel(
                     self.model_size,
@@ -71,31 +80,34 @@ class VoiceInput:
         print(f"[VoiceInput] 录音 {duration} 秒...")
 
         try:
-            # 使用 arecord 录音 (Linux)
+            # 使用 arecord 录音 (Linux) - 直接输出到文件
+            import tempfile
+            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+
             cmd = [
                 "arecord",
                 "-q",  # 安静模式
-                "-t", "wav",  # 输出格式
+                "-d", "3",  # 录音时长
                 "-f", "S16_LE",  # 格式
                 "-c", "1",  # 单声道
                 "-r", str(sample_rate),  # 采样率
-                "-d", "default",  # 设备
-                "-"  # 输出到 stdout
+                temp_path
             ]
 
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            result = subprocess.run(cmd, capture_output=True, timeout=duration + 5)
 
-            # 录音指定时长
-            audio_data, _ = process.communicate(timeout=duration)
-            return audio_data
+            if result.returncode == 0:
+                with open(temp_path, 'rb') as f:
+                    audio_data = f.read()
+                os.unlink(temp_path)
+                return audio_data
+            else:
+                os.unlink(temp_path)
+                print(f"[VoiceInput] arecord 错误: {result.stderr.decode()}")
+                return b""
 
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return b""
         except Exception as e:
             print(f"[VoiceInput] 录音失败: {e}")
             # 尝试使用 pyaudio
@@ -149,11 +161,21 @@ class VoiceInput:
 
         try:
             print("[VoiceInput] 正在识别...")
+            # 将音频数据保存到临时文件
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                temp_path = temp_file.name
+                temp_file.write(audio_data)
+
+            # 使用文件路径进行识别
             segments, info = self.model.transcribe(
-                audio_data,
+                temp_path,
                 language=language,
                 beam_size=5
             )
+
+            # 删除临时文件
+            os.unlink(temp_path)
 
             text = "".join([seg.text for seg in segments])
             print(f"[VoiceInput] 识别结果: {text}")
