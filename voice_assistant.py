@@ -1,6 +1,6 @@
 """
 语音助手核心类 - 方案B自建轻量框架
-核心功能：意图识别 + 工具执行 + 记忆系统 + 唤醒词检测
+核心功能：意图识别 + 工具执行 + 记忆系统 + 唤醒词检测 + 语音 I/O
 """
 
 import asyncio
@@ -11,6 +11,7 @@ from typing import Optional, Dict, List, Callable
 from ollama import Client
 import zmq
 from wake_word_detector import WakeWordDetector
+from voice_io import VoiceInput, VoiceOutput
 
 # ==================== 数据类 ====================
 
@@ -60,6 +61,10 @@ class VoiceAssistant:
 
         # 初始化唤醒词检测
         self.wake_detector = WakeWordDetector(self.wake_word)
+
+        # 初始化语音 I/O
+        self.voice_input = VoiceInput(model_size="tiny", device="cuda")
+        self.voice_output = VoiceOutput()
 
         # 工具注册表
         self.tools: Dict[str, Callable] = {}
@@ -286,6 +291,11 @@ class VoiceAssistant:
 async def main():
     """主函数 - 测试"""
 
+    import sys
+
+    # 检查命令行参数
+    use_voice = "--voice" in sys.argv or "-v" in sys.argv
+
     # 创建助手实例
     config = {
         "ollama_host": "localhost:11434",
@@ -321,33 +331,51 @@ async def main():
     )
 
     # 交互式测试
+    mode = "语音" if use_voice else "文本"
     print("\n" + "="*50)
-    print("语音助手测试模式（已连接 ROS2 + 唤醒词检测）")
+    print(f"语音助手测试模式（{mode}输入）")
     print(f"唤醒词: {assistant.wake_word}")
-    print("输入文本测试，输入 'quit' 退出")
+    print(f"ROS2 桥接: {assistant.orange_pi_addr}")
+    print("输入 'quit' 退出，'voice' 切换到语音模式")
     print("="*50 + "\n")
 
     while True:
         try:
-            user_input = input("你: ")
+            if use_voice:
+                # 语音输入模式
+                print("请说话...")
+                audio_data = assistant.voice_input.record_audio(duration=3)
+
+                if audio_data:
+                    user_input = assistant.voice_input.transcribe(audio_data)
+                    if user_input:
+                        print(f"识别: {user_input}")
+                    else:
+                        print("未识别到语音")
+                        continue
+                else:
+                    print("录音失败")
+                    continue
+            else:
+                # 文本输入模式
+                user_input = input("你: ")
+                if user_input.lower() == 'voice':
+                    use_voice = True
+                    print("切换到语音模式")
+                    continue
 
             if user_input.lower() in ['quit', 'exit', '退出']:
                 break
 
-            # 检查是否包含唤醒词
-            if assistant.wake_detector.check_text(user_input):
-                print(f"[唤醒词检测] 检测到唤醒词!")
-                # 移除唤醒词，处理剩余指令
-                command = user_input.replace(assistant.wake_word, "", 1).strip()
-                if command:
-                    response = await assistant.process(command)
-                    print(f"助手: {response}\n")
-                else:
-                    print("助手: 我在，请说指令\n")
-            else:
-                # 直接处理
-                response = await assistant.process(user_input)
-                print(f"助手: {response}\n")
+            # 处理输入
+            response = await assistant.process(user_input)
+            print(f"助手: {response}")
+
+            # 语音输出
+            if use_voice:
+                await assistant.voice_output.speak(response)
+
+            print()  # 空行
 
         except KeyboardInterrupt:
             break
